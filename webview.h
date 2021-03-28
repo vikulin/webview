@@ -180,7 +180,7 @@ inline std::string url_decode(const std::string st) {
   size_t length = strlen(s);
   for (unsigned int i = 0; i < length; i++) {
     if (s[i] == '%') {
-//      decoded.push_back(hex2char(s + i + 1));
+      decoded.push_back(hex2char(s + i + 1));
       i = i + 2;
     } else if (s[i] == '+') {
       decoded.push_back(' ');
