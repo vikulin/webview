@@ -138,27 +138,6 @@ WEBVIEW_API void webview_return(webview_t w, const char *seq, int status,
 namespace webview {
 using dispatch_fn_t = std::function<void()>;
 
-// Convert ASCII hex digit to a nibble (four bits, 0 - 15).
-//
-// Use unsigned to avoid signed overflow UB.
-static inline unsigned char hex2nibble(unsigned char c) {
-  if (c >= '0' && c <= '9') {
-    return c - '0';
-  } else if (c >= 'a' && c <= 'f') {
-    return 10 + (c - 'a');
-  } else if (c >= 'A' && c <= 'F') {
-    return 10 + (c - 'A');
-  }
-  return 0;
-}
-
-// Convert ASCII hex string (two characters) to byte.
-//
-// E.g., "0B" => 0x0B, "af" => 0xAF.
-static inline char hex2char(const char *p) {
-  return hex2nibble(p[0]) * 16 + hex2nibble(p[1]);
-}
-
 inline std::string url_encode(const std::string s) {
   std::string encoded;
   for (unsigned int i = 0; i < s.length(); i++) {
@@ -174,18 +153,18 @@ inline std::string url_encode(const std::string s) {
   return encoded;
 }
 
-inline std::string url_decode(const std::string st) {
+inline std::string url_decode(const std::string s) {
   std::string decoded;
-  const char *s = st.c_str();
-  size_t length = strlen(s);
-  for (unsigned int i = 0; i < length; i++) {
+  for (unsigned int i = 0; i < s.length(); i++) {
     if (s[i] == '%') {
-      decoded.push_back(hex2char(s + i + 1));
+      int n;
+      n = std::stoul(s.substr(i + 1, 2), nullptr, 16);
+      decoded = decoded + static_cast<char>(n);
       i = i + 2;
     } else if (s[i] == '+') {
-      decoded.push_back(' ');
+      decoded = decoded + ' ';
     } else {
-      decoded.push_back(s[i]);
+      decoded = decoded + s[i];
     }
   }
   return decoded;
@@ -928,7 +907,10 @@ private:
 class edge_chromium : public browser {
 public:
   bool embed(HWND wnd, bool debug, msg_cb_t cb) override {
-    CoInitializeEx(nullptr, 0);
+    if (CoInitializeEx(nullptr, COINIT_MULTITHREADED) != S_OK) {
+      return false;
+    }
+
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
     flag.test_and_set();
 
@@ -941,19 +923,35 @@ public:
         wideCharConverter.from_bytes(std::getenv("APPDATA"));
     std::wstring currentExeNameW = wideCharConverter.from_bytes(currentExeName);
 
-    HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, (userDataFolder + L"/" + currentExeNameW).c_str(), nullptr,
-        new webview2_com_handler(wnd, cb,
-                                 [&](ICoreWebView2Controller *controller) {
-                                   m_controller = controller;
-                                   m_controller->get_CoreWebView2(&m_webview);
-                                   m_webview->AddRef();
-                                   flag.clear();
-                                 }));
+    // TODO: Maybe we need to implement memory cleanup?
+    auto webview2ComHandler = new webview2_com_handler(
+        wnd, cb, [&](ICoreWebView2Controller *controller) {
+          m_controller = controller;
+          m_controller->get_CoreWebView2(&m_webview);
+          m_webview->AddRef();
+          flag.clear();
+        });
+
+    HRESULT res =
+        createEnvironment(userDataFolder, currentExeNameW, webview2ComHandler);
+
+    // "HRESULT - 0x80010106 - Cannot change thread mode after it is set."
+    if (webview2ComHandler->getLastEnvironmentCompleteResult() == 0x80010106) {
+      CoUninitialize();
+      if (CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED) != S_OK) {
+        delete webview2ComHandler;
+        return false;
+      }
+      res = createEnvironment(userDataFolder, currentExeNameW,
+                              webview2ComHandler);
+    }
+
     if (res != S_OK) {
+      delete webview2ComHandler;
       CoUninitialize();
       return false;
     }
+
     MSG msg = {};
     while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0)) {
       TranslateMessage(&msg);
@@ -1013,6 +1011,11 @@ private:
     webview2_com_handler(HWND hwnd, msg_cb_t msgCb,
                          webview2_com_handler_cb_t cb)
         : m_window(hwnd), m_msgCb(msgCb), m_cb(cb) {}
+
+    HRESULT getLastEnvironmentCompleteResult() const {
+      return lastEnvironmentCompleteResult;
+    }
+
     ULONG STDMETHODCALLTYPE AddRef() { return 1; }
     ULONG STDMETHODCALLTYPE Release() { return 1; }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv) {
@@ -1020,8 +1023,15 @@ private:
     }
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT res,
                                      ICoreWebView2Environment *env) {
-      env->CreateCoreWebView2Controller(m_window, this);
-      return S_OK;
+
+      lastEnvironmentCompleteResult = res;
+
+      if (res == S_OK) {
+        env->CreateCoreWebView2Controller(m_window, this);
+        return S_OK;
+      }
+
+      return S_FALSE;
     }
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT res,
                                      ICoreWebView2Controller *controller) {
@@ -1063,7 +1073,16 @@ private:
     HWND m_window;
     msg_cb_t m_msgCb;
     webview2_com_handler_cb_t m_cb;
+    HRESULT lastEnvironmentCompleteResult;
   };
+
+  HRESULT createEnvironment(const std::wstring &userDataFolder,
+                            const std::wstring &currentExeNameW,
+                            webview2_com_handler *webview2ComHandler) const {
+    return CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, (userDataFolder + L"/" + currentExeNameW).c_str(), nullptr,
+        webview2ComHandler);
+  }
 };
 
 class win32_edge_engine {
