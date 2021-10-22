@@ -907,6 +907,7 @@ private:
 class edge_chromium : public browser {
 public:
   bool embed(HWND wnd, bool debug, msg_cb_t cb) override {
+
     if (CoInitializeEx(nullptr, COINIT_MULTITHREADED) != S_OK) {
       return false;
     }
